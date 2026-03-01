@@ -18,6 +18,7 @@ create table public.profiles (
   full_name text,
   email text,
   avatar_url text,
+  is_admin boolean default false,
   kyc_status text default 'none' check (kyc_status in ('none', 'pending', 'verified')),
   withdrawal_fee numeric default 5,
   referral_code text unique,
@@ -99,8 +100,11 @@ alter table public.watchlist enable row level security;
 
 -- 9. RLS POLICIES
 
--- Profiles: Users can view and update their own profile
+-- Profiles: Users can view and update their own profile; Admins can view all
 create policy "Users can view own profile" on public.profiles for select using (auth.uid() = id);
+create policy "Admins can view all profiles" on public.profiles for select using (
+  exists (select 1 from public.profiles where id = auth.uid() and is_admin = true)
+);
 create policy "Users can update own profile" on public.profiles for update using (auth.uid() = id);
 
 -- User Stats: Users can view their own stats

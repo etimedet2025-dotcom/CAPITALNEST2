@@ -7,6 +7,8 @@ import { BottomNav } from './components/BottomNav';
 import { STATS, ASSETS } from './constants';
 import { AppView, AdminSubView, Asset, Notification, Transaction, PayoutMethod, BillingCard, Investor } from './types';
 import { supabaseService } from './services/supabaseService';
+import { supabase } from './src/supabaseClient';
+import { stockService } from './src/services/stockService';
 import { 
   AreaChart,
   Area,
@@ -247,8 +249,20 @@ const App: React.FC = () => {
   const [dbAssets, setDbAssets] = useState<Asset[]>(ASSETS);
   const [dbTransactions, setDbTransactions] = useState<Transaction[]>(TRANSACTIONS);
   const [userStats, setUserStats] = useState<any>(null);
+  const [currentUser, setCurrentUser] = useState<any>(null);
   const [selectedCountry, setSelectedCountry] = useState(COUNTRIES[0]);
   
+  // Auth State
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [fullName, setFullName] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [phoneNumber, setPhoneNumber] = useState('');
+  const [referralCode, setReferralCode] = useState('');
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [authSuccess, setAuthSuccess] = useState<string | null>(null);
+  const [authLoading, setAuthLoading] = useState(false);
+
   const [searchQuery, setSearchQuery] = useState('');
   const [isSearchActive, setIsSearchActive] = useState(false);
   const [isNotificationsOpen, setIsNotificationsOpen] = useState(false);
@@ -271,16 +285,15 @@ const App: React.FC = () => {
 
   // Admin Sub-view State
   const [adminSubView, setAdminSubView] = useState<AdminSubView>('dashboard');
-  const [adminUsers, setAdminUsers] = useState([
-    { id: '1', name: 'Alex Volkov', email: 'alex@volkov.io', balance: 1118070.42, kyc: 'verified', withdrawalFee: 5 },
-    { id: '2', name: 'Sarah Chen', email: 'sarah@chen.com', balance: 45200.00, kyc: 'pending', withdrawalFee: 5 },
-    { id: '3', name: 'Marcus Thorne', email: 'marcus@thorne.net', balance: 890000.00, kyc: 'none', withdrawalFee: 5 },
-  ]);
+  const [adminUsers, setAdminUsers] = useState<any[]>([]);
+  const [adminTransactions, setAdminTransactions] = useState<any[]>([]);
 
   // Settings State
   const [notificationsEnabled, setNotificationsEnabled] = useState(true);
   const [biometricsEnabled, setBiometricsEnabled] = useState(false);
   const [language, setLanguage] = useState('English');
+  const [isUpdatingPrices, setIsUpdatingPrices] = useState(false);
+  const [lastPriceUpdate, setLastPriceUpdate] = useState<Date | null>(null);
 
   const isMatured = (dateStr: string) => {
     const maturityDate = new Date(dateStr);
@@ -310,9 +323,48 @@ const App: React.FC = () => {
       setView('admin_auth');
     }
 
+    // Check session on mount
+    supabase.auth.getSession().then(async ({ data: { session } }) => {
+      if (session) {
+        setIsLoggedIn(true);
+        setCurrentUser(session.user);
+        const adminStatus = await supabaseService.isAdmin(session.user.id);
+        setIsAdmin(adminStatus);
+        if (view === 'auth') setView('home');
+      } else {
+        setIsLoggedIn(false);
+        setCurrentUser(null);
+        setIsAdmin(false);
+        // Protect private views
+        const privateViews: AppView[] = ['home', 'portfolio', 'insights', 'profile', 'referral', 'kyc', 'deposit', 'withdraw', 'transfer', 'history', 'buy', 'sell', 'settings', 'security', 'payments', 'add_payment', 'billing_setup', 'add_card', 'identity', 'withdrawal_detail', 'swap', 'invest', 'asset_detail', 'buy_asset', 'notifications'];
+        if (privateViews.includes(view)) {
+          setView('auth');
+        }
+      }
+    });
+
+    // Listen for auth changes
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (_event, session) => {
+      if (session) {
+        setIsLoggedIn(true);
+        setCurrentUser(session.user);
+        const adminStatus = await supabaseService.isAdmin(session.user.id);
+        setIsAdmin(adminStatus);
+        if (view === 'auth') setView('home');
+      } else {
+        setIsLoggedIn(false);
+        setCurrentUser(null);
+        setIsAdmin(false);
+        // Only redirect to auth if not on admin views
+        if (view !== 'admin_auth' && view !== 'admin_dashboard') {
+          setView('auth');
+        }
+      }
+    });
+
     // Supabase Real-time Setup
-    if (isLoggedIn) {
-      const userId = 'user-123'; // In a real app, this would come from auth
+    if (isLoggedIn && currentUser) {
+      const userId = currentUser.id;
 
       // Initial Fetch
       const fetchData = async () => {
@@ -362,7 +414,81 @@ const App: React.FC = () => {
         notifSub.unsubscribe();
       };
     }
-  }, [isLoggedIn]);
+
+    // Admin Data Fetch
+    if (view === 'admin_dashboard' && isAdmin) {
+      const fetchAdminData = async () => {
+        try {
+          const [profiles, txs] = await Promise.all([
+            supabaseService.getAllProfiles(),
+            supabaseService.getAllTransactions()
+          ]);
+          setAdminUsers(profiles);
+          setAdminTransactions(txs);
+        } catch (err) {
+          console.error('Error fetching admin data:', err);
+        }
+      };
+      fetchAdminData();
+    }
+  }, [isLoggedIn, currentUser, view, isAdmin]);
+
+  // Live Stock Price Updates
+  const updatePrices = async () => {
+    if (isUpdatingPrices || dbAssets.length === 0) return;
+    
+    setIsUpdatingPrices(true);
+    haptic.light();
+    
+    try {
+      const updatedAssets = [...dbAssets];
+      let hasChanges = false;
+
+      // Alpha Vantage free tier is 5 calls/min. 
+      // We update assets one by one with a delay to avoid hitting limits.
+      for (let i = 0; i < updatedAssets.length; i++) {
+        const asset = updatedAssets[i];
+        try {
+          const quote = await stockService.getQuote(asset.symbol);
+          if (quote) {
+            updatedAssets[i] = {
+              ...asset,
+              current_price: quote.price,
+              change_percent: quote.changePercent,
+              isPositive: quote.change >= 0
+            };
+            hasChanges = true;
+          }
+        } catch (err) {
+          console.error(`Failed to update ${asset.symbol}:`, err);
+        }
+        
+        // Wait 12.5 seconds between calls to stay safely within 5 calls/min limit
+        if (i < updatedAssets.length - 1) {
+          await new Promise(resolve => setTimeout(resolve, 12500));
+        }
+      }
+
+      if (hasChanges) {
+        setDbAssets(updatedAssets);
+        setLastPriceUpdate(new Date());
+      }
+    } catch (error) {
+      console.error('Error in updatePrices:', error);
+    } finally {
+      setIsUpdatingPrices(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!isLoggedIn || dbAssets.length === 0) return;
+
+    // Initial update
+    updatePrices();
+
+    const interval = setInterval(updatePrices, 600000); // Auto-update every 10 minutes
+    return () => clearInterval(interval);
+  }, [isLoggedIn, dbAssets.length === 0]);
 
   const handleNavigate = (newView: AppView) => {
     haptic.light();
@@ -372,8 +498,9 @@ const App: React.FC = () => {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
-  const handleLogOut = () => {
+  const handleLogOut = async () => {
     haptic.medium();
+    await supabase.auth.signOut();
     setIsLoggedIn(false);
     setIsAdmin(false);
     setView('auth');
@@ -386,14 +513,112 @@ const App: React.FC = () => {
     document.documentElement.classList.toggle('dark');
   };
 
-  const toggleFavorite = (symbol: string) => {
+  const toggleFavorite = async (symbol: string) => {
     haptic.medium();
+    const isFavorite = !favorites.has(symbol);
+    
     setFavorites(prev => {
       const next = new Set(prev);
       if (next.has(symbol)) next.delete(symbol);
       else next.add(symbol);
       return next;
     });
+
+    if (currentUser) {
+      try {
+        await supabaseService.toggleFavorite(currentUser.id, symbol, isFavorite);
+      } catch (err) {
+        console.error('Error toggling favorite:', err);
+      }
+    }
+  };
+
+  const handleSignUp = async () => {
+    setAuthError(null);
+    setAuthSuccess(null);
+    if (!email || !password) {
+      setAuthError("Email and password are required");
+      return;
+    }
+    if (password !== confirmPassword) {
+      setAuthError("Passwords do not match");
+      return;
+    }
+    setAuthLoading(true);
+    try {
+      const { data, error } = await supabase.auth.signUp({
+        email,
+        password,
+        options: {
+          data: {
+            full_name: fullName,
+            phone: phoneNumber,
+            referral_code: referralCode,
+          },
+        },
+      });
+      if (error) throw error;
+      
+      haptic.success();
+      
+      if (!data.session) {
+        setAuthSuccess("Check your email and confirm your account before logging in.");
+        setAuthMode('login');
+      } else {
+        setIsLoggedIn(true);
+        setView('home');
+      }
+    } catch (err: any) {
+      setAuthError(err.message);
+      haptic.error();
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const handleSignIn = async () => {
+    setAuthError(null);
+    setAuthSuccess(null);
+    if (!email || !password) {
+      setAuthError("Email and password are required");
+      return;
+    }
+    setAuthLoading(true);
+    try {
+      const { data, error } = await supabase.auth.signInWithPassword({
+        email,
+        password,
+      });
+      if (error) throw error;
+      
+      if (data.session) {
+        haptic.success();
+        setIsLoggedIn(true);
+        setView('home');
+      }
+    } catch (err: any) {
+      setAuthError(err.message);
+      haptic.error();
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const handleGoogleAuth = async () => {
+    setAuthError(null);
+    setAuthSuccess(null);
+    try {
+      const { error } = await supabase.auth.signInWithOAuth({
+        provider: 'google',
+        options: {
+          redirectTo: window.location.origin
+        }
+      });
+      if (error) throw error;
+    } catch (err: any) {
+      setAuthError(err.message);
+      haptic.error();
+    }
   };
 
   const filteredAssets = useMemo(() => {
@@ -422,12 +647,30 @@ const App: React.FC = () => {
         </div>
 
         <div className="space-y-4">
+          {authError && (
+            <div className="bg-rose-500/10 border border-rose-500/20 rounded-2xl p-4 animate-in fade-in slide-in-from-top-2 duration-300">
+              <p className="text-xs font-bold text-rose-500 text-center">{authError}</p>
+            </div>
+          )}
+          
+          {authSuccess && (
+            <div className="bg-emerald-500/10 border border-emerald-500/20 rounded-2xl p-4 animate-in fade-in slide-in-from-top-2 duration-300">
+              <p className="text-xs font-bold text-emerald-500 text-center">{authSuccess}</p>
+            </div>
+          )}
+
           {authMode === 'signup' && (
             <div className="space-y-1.5">
               <label className="text-[10px] font-black uppercase tracking-widest text-slate-400 ml-1">Full Name</label>
               <div className="relative group">
                 <User className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-400 group-focus-within:text-blue-500 transition-colors" size={18} />
-                <input type="text" placeholder="Alex Volkov" className="w-full bg-slate-500/5 dark:bg-white/5 border border-slate-200 dark:border-transparent focus:border-blue-500/30 rounded-2xl py-4 pl-12 pr-4 outline-none text-sm dark:text-white transition-all" />
+                <input 
+                  type="text" 
+                  placeholder="Alex Volkov" 
+                  value={fullName}
+                  onChange={(e) => setFullName(e.target.value)}
+                  className="w-full bg-slate-500/5 dark:bg-white/5 border border-slate-200 dark:border-transparent focus:border-blue-500/30 rounded-2xl py-4 pl-12 pr-4 outline-none text-sm dark:text-white transition-all" 
+                />
               </div>
             </div>
           )}
@@ -436,7 +679,13 @@ const App: React.FC = () => {
             <label className="text-[10px] font-black uppercase tracking-widest text-slate-400 ml-1">Email Address</label>
             <div className="relative group">
               <Mail className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-400 group-focus-within:text-blue-500 transition-colors" size={18} />
-              <input type="email" placeholder="alex@volkov.io" className="w-full bg-slate-500/5 dark:bg-white/5 border border-slate-200 dark:border-transparent focus:border-blue-500/30 rounded-2xl py-4 pl-12 pr-4 outline-none text-sm dark:text-white transition-all" />
+              <input 
+                type="email" 
+                placeholder="alex@volkov.io" 
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                className="w-full bg-slate-500/5 dark:bg-white/5 border border-slate-200 dark:border-transparent focus:border-blue-500/30 rounded-2xl py-4 pl-12 pr-4 outline-none text-sm dark:text-white transition-all" 
+              />
             </div>
           </div>
 
@@ -462,7 +711,13 @@ const App: React.FC = () => {
                 </div>
                 <div className="relative flex-1 group">
                   <Phone className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-400 group-focus-within:text-blue-500 transition-colors" size={18} />
-                  <input type="tel" placeholder="555 0123" className="w-full bg-slate-500/5 dark:bg-white/5 border border-slate-200 dark:border-transparent focus:border-blue-500/30 rounded-2xl py-4 pl-12 pr-4 outline-none text-sm dark:text-white transition-all font-bold" />
+                  <input 
+                    type="tel" 
+                    placeholder="555 0123" 
+                    value={phoneNumber}
+                    onChange={(e) => setPhoneNumber(e.target.value)}
+                    className="w-full bg-slate-500/5 dark:bg-white/5 border border-slate-200 dark:border-transparent focus:border-blue-500/30 rounded-2xl py-4 pl-12 pr-4 outline-none text-sm dark:text-white transition-all font-bold" 
+                  />
                 </div>
               </div>
             </div>
@@ -475,6 +730,8 @@ const App: React.FC = () => {
               <input 
                 type={showPassword ? "text" : "password"} 
                 placeholder="••••••••" 
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
                 className="w-full bg-slate-500/5 dark:bg-white/5 border border-slate-200 dark:border-transparent focus:border-blue-500/30 rounded-2xl py-4 pl-12 pr-12 outline-none text-sm dark:text-white transition-all" 
               />
               <button 
@@ -494,6 +751,8 @@ const App: React.FC = () => {
                 <input 
                   type={showPassword ? "text" : "password"} 
                   placeholder="••••••••" 
+                  value={confirmPassword}
+                  onChange={(e) => setConfirmPassword(e.target.value)}
                   className="w-full bg-slate-500/5 dark:bg-white/5 border border-slate-200 dark:border-transparent focus:border-blue-500/30 rounded-2xl py-4 pl-12 pr-12 outline-none text-sm dark:text-white transition-all" 
                 />
               </div>
@@ -505,7 +764,13 @@ const App: React.FC = () => {
               <label className="text-[10px] font-black uppercase tracking-widest text-slate-400 ml-1">Referral Code (Optional)</label>
               <div className="relative group">
                 <Hash className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-400 group-focus-within:text-blue-500 transition-colors" size={18} />
-                <input type="text" placeholder="REF-123456" className="w-full bg-slate-500/5 dark:bg-white/5 border border-slate-200 dark:border-transparent focus:border-blue-500/30 rounded-2xl py-4 pl-12 pr-4 outline-none text-sm dark:text-white transition-all" />
+                <input 
+                  type="text" 
+                  placeholder="REF-123456" 
+                  value={referralCode}
+                  onChange={(e) => setReferralCode(e.target.value)}
+                  className="w-full bg-slate-500/5 dark:bg-white/5 border border-slate-200 dark:border-transparent focus:border-blue-500/30 rounded-2xl py-4 pl-12 pr-4 outline-none text-sm dark:text-white transition-all" 
+                />
               </div>
             </div>
           )}
@@ -525,10 +790,18 @@ const App: React.FC = () => {
 
         <div className="space-y-4">
           <button 
-            onClick={() => { haptic.success(); setIsLoggedIn(true); setView('home'); }}
-            className="w-full bg-blue-600 hover:bg-blue-700 text-white font-black py-5 rounded-3xl shadow-xl shadow-blue-500/25 transition-all active:scale-[0.98] uppercase tracking-[0.2em] text-xs"
+            onClick={() => {
+              if (authMode === 'login') handleSignIn();
+              else handleSignUp();
+            }}
+            disabled={authLoading}
+            className="w-full bg-blue-600 hover:bg-blue-700 text-white font-black py-5 rounded-3xl shadow-xl shadow-blue-500/25 transition-all active:scale-[0.98] uppercase tracking-[0.2em] text-xs flex items-center justify-center gap-2"
           >
-            {authMode === 'login' ? 'Authorize Access' : 'Create Portfolio'}
+            {authLoading ? (
+              <Loader2 className="w-4 h-4 animate-spin" />
+            ) : (
+              authMode === 'login' ? 'Authorize Access' : 'Create Portfolio'
+            )}
           </button>
 
           <div className="relative flex items-center justify-center py-2">
@@ -537,7 +810,10 @@ const App: React.FC = () => {
           </div>
 
           <div className="flex justify-center">
-            <button className="w-full flex items-center justify-center gap-3 py-4 bg-slate-500/5 dark:bg-white/5 border border-slate-200 dark:border-transparent rounded-2xl hover:bg-slate-500/10 transition-all active:scale-95">
+            <button 
+              onClick={handleGoogleAuth}
+              className="w-full flex items-center justify-center gap-3 py-4 bg-slate-500/5 dark:bg-white/5 border border-slate-200 dark:border-transparent rounded-2xl hover:bg-slate-500/10 transition-all active:scale-95"
+            >
               <svg className="w-5 h-5" viewBox="0 0 24 24">
                 <path fill="currentColor" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" />
                 <path fill="currentColor" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" />
@@ -565,12 +841,30 @@ const App: React.FC = () => {
     </div>
   );
 
-  const triggerTransaction = (onSuccess: () => void) => {
+  const triggerTransaction = (onSuccess: () => void, type: Transaction['type'] = 'buy', amount: number = 0, assetSymbol?: string) => {
     haptic.medium();
     setTransactionStatus('processing');
-    setTimeout(() => {
+    
+    setTimeout(async () => {
       const isSuccess = Math.random() > 0.1; // 90% success rate
       if (isSuccess) {
+        if (currentUser) {
+          try {
+            await supabaseService.createTransaction({
+              user_id: currentUser.id,
+              type,
+              amount,
+              asset_symbol: assetSymbol,
+              status: 'completed'
+            });
+            // Refresh transactions
+            const txs = await supabaseService.getTransactions(currentUser.id);
+            setDbTransactions(txs);
+          } catch (err) {
+            console.error('Error saving transaction:', err);
+          }
+        }
+        
         setTransactionStatus('success');
         haptic.success();
         setTimeout(() => {
@@ -743,13 +1037,30 @@ const App: React.FC = () => {
           </button>
           <h2 className="text-2xl font-black tracking-tight text-slate-900 dark:text-white">Portfolio</h2>
         </div>
-        <button 
-          onClick={() => { haptic.light(); setShowOnlyFavorites(!showOnlyFavorites); }}
-          className={`p-2 rounded-xl border flex items-center gap-2 transition-all ${showOnlyFavorites ? 'bg-amber-500/10 border-amber-500/50 text-amber-500' : 'bg-gray-500/10 border-transparent text-slate-500'}`}
-        >
-          <Star size={16} fill={showOnlyFavorites ? "currentColor" : "none"} />
-        </button>
+        <div className="flex items-center gap-2">
+          <button 
+            onClick={updatePrices}
+            disabled={isUpdatingPrices}
+            className={`p-2 rounded-xl border flex items-center gap-2 transition-all ${isUpdatingPrices ? 'bg-blue-500/10 border-blue-500/30 text-blue-500' : 'bg-gray-500/10 border-transparent text-slate-500'}`}
+          >
+            <Activity size={16} className={isUpdatingPrices ? 'animate-pulse' : ''} />
+          </button>
+          <button 
+            onClick={() => { haptic.light(); setShowOnlyFavorites(!showOnlyFavorites); }}
+            className={`p-2 rounded-xl border flex items-center gap-2 transition-all ${showOnlyFavorites ? 'bg-amber-500/10 border-amber-500/50 text-amber-500' : 'bg-gray-500/10 border-transparent text-slate-500'}`}
+          >
+            <Star size={16} fill={showOnlyFavorites ? "currentColor" : "none"} />
+          </button>
+        </div>
       </div>
+      
+      {lastPriceUpdate && (
+        <div className="px-2 mb-4">
+          <p className="text-[8px] font-black uppercase tracking-widest text-slate-400">
+            Last Market Sync: {lastPriceUpdate.toLocaleTimeString()}
+          </p>
+        </div>
+      )}
       <div className="space-y-3">
         {filteredAssets.map((asset) => {
           const matured = isMatured(asset.maturityDate);
@@ -925,7 +1236,7 @@ const App: React.FC = () => {
             if (amount > 0) {
               triggerTransaction(() => {
                 handleNavigate('history');
-              });
+              }, 'buy', amount, selectedAsset.symbol);
             }
           }} 
           className={`w-full py-5 font-black rounded-[32px] shadow-xl transition-all uppercase tracking-widest text-sm ${amount > 0 ? 'bg-blue-600 text-white shadow-blue-500/20 active:scale-95' : 'bg-gray-500/10 text-slate-400 cursor-not-allowed'}`}
@@ -1247,7 +1558,7 @@ const App: React.FC = () => {
         onClick={() => { 
           triggerTransaction(() => {
             handleNavigate('history');
-          });
+          }, type, parseFloat(orderAmount));
         }} 
         className="w-full py-5 bg-blue-600 text-white font-black rounded-[32px] shadow-xl shadow-blue-500/20 active:scale-95 transition-all uppercase tracking-widest text-sm"
       >
@@ -1265,7 +1576,24 @@ const App: React.FC = () => {
           </button>
           <h2 className="text-2xl font-black tracking-tight text-slate-900 dark:text-white">Notifications</h2>
         </div>
-        <button onClick={() => setNotifications(notifications.map(n => ({ ...n, unread: false })))} className="text-[10px] font-black uppercase tracking-widest text-blue-600">Mark all read</button>
+        <button 
+          onClick={async () => { 
+            haptic.light();
+            setNotifications(notifications.map(n => ({ ...n, unread: false })));
+            if (currentUser) {
+              try {
+                // In a real app, we'd have a bulk update, but here we'll just mark them read in state
+                // and the user can refresh. For simplicity, we'll just update the state.
+                // If we wanted to persist: await Promise.all(notifications.map(n => supabaseService.markNotificationRead(n.id)));
+              } catch (err) {
+                console.error('Error marking all read:', err);
+              }
+            }
+          }} 
+          className="text-[10px] font-black uppercase tracking-widest text-blue-600"
+        >
+          Mark all read
+        </button>
       </div>
       <div className="space-y-3">
         {notifications.length > 0 ? (
@@ -1669,11 +1997,17 @@ const App: React.FC = () => {
         </div>
 
         <button 
-          onClick={() => {
-            haptic.success();
-            setIsAdmin(true);
-            setIsLoggedIn(true);
-            setView('admin_dashboard');
+          onClick={async () => {
+            haptic.light();
+            if (currentUser && isAdmin) {
+              haptic.success();
+              setView('admin_dashboard');
+            } else if (currentUser) {
+              alert('Access Denied: You do not have administrator privileges.');
+            } else {
+              alert('Please log in through the main portal first.');
+              setView('auth');
+            }
           }}
           className="w-full py-5 bg-slate-900 text-white font-black rounded-3xl shadow-xl active:scale-95 transition-all uppercase tracking-widest text-sm"
         >

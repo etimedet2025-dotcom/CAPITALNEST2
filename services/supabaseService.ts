@@ -54,6 +54,18 @@ export const supabaseService = {
       .subscribe();
   },
 
+  async createTransaction(transaction: Omit<Transaction, 'id' | 'created_at'> & { user_id: string }) {
+    if (!isConfigured) return null;
+    const { data, error } = await supabase
+      .from('transactions')
+      .insert([transaction])
+      .select()
+      .single();
+    
+    if (error) throw error;
+    return data as Transaction;
+  },
+
   // Notifications
   async getNotifications(userId: string) {
     if (!isConfigured) return [];
@@ -65,6 +77,77 @@ export const supabaseService = {
     
     if (error) throw error;
     return data as Notification[];
+  },
+
+  async markNotificationRead(notificationId: string) {
+    if (!isConfigured) return;
+    const { error } = await supabase
+      .from('notifications')
+      .update({ unread: false })
+      .eq('id', notificationId);
+    
+    if (error) throw error;
+  },
+
+  async deleteNotification(notificationId: string) {
+    if (!isConfigured) return;
+    const { error } = await supabase
+      .from('notifications')
+      .delete()
+      .eq('id', notificationId);
+    
+    if (error) throw error;
+  },
+
+  // Watchlist / Favorites
+  async toggleFavorite(userId: string, symbol: string, isFavorite: boolean) {
+    if (!isConfigured) return;
+    if (isFavorite) {
+      await supabase
+        .from('watchlist')
+        .insert([{ user_id: userId, asset_symbol: symbol }]);
+    } else {
+      await supabase
+        .from('watchlist')
+        .delete()
+        .eq('user_id', userId)
+        .eq('asset_symbol', symbol);
+    }
+  },
+
+  // Admin Methods
+  async isAdmin(userId: string) {
+    if (!isConfigured) return false;
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('is_admin')
+      .eq('id', userId)
+      .single();
+    
+    if (error) return false;
+    return data?.is_admin || false;
+  },
+
+  async getAllProfiles() {
+    if (!isConfigured) return [];
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('*')
+      .order('created_at', { ascending: false });
+    
+    if (error) throw error;
+    return data;
+  },
+
+  async getAllTransactions() {
+    if (!isConfigured) return [];
+    const { data, error } = await supabase
+      .from('transactions')
+      .select('*, profiles(full_name, email)')
+      .order('created_at', { ascending: false });
+    
+    if (error) throw error;
+    return data;
   },
 
   subscribeToNotifications(userId: string, callback: (payload: any) => void) {
